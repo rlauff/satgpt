@@ -1,9 +1,10 @@
 use std::env;
 use std::fs;
 use std::fmt;
-use std::mem;
 
-// Basic Types & Structures
+// =========================================================================
+// Types
+// =========================================================================
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub struct Lit(u32);
@@ -55,7 +56,15 @@ pub struct Clause {
     learned: bool, 
 }
 
+#[derive(Debug, Copy, Clone)]
+struct Watcher {
+    clause_idx: u32,
+    blocker: Lit, 
+}
+
+// =========================================================================
 // Branching Strategy
+// =========================================================================
 
 pub trait BranchingStrategy {
     fn pick_branch(&mut self, solver: &Solver) -> Option<Lit>;
@@ -64,76 +73,65 @@ pub trait BranchingStrategy {
     fn on_unassign(&mut self, var: usize, old_value: bool);
 }
 
-pub struct VsidsStrategy {
-    activity: Vec<f64>,
-    var_inc: f64,
-    var_decay: f64,
-    saved_phases: Vec<bool>,
+// --- Random Strategy (Default) ---
+
+pub struct RandomStrategy {
+    rng_state: u64,
+    num_vars: usize,
 }
 
-impl VsidsStrategy {
+impl RandomStrategy {
     pub fn new(num_vars: usize) -> Self {
         Self {
-            activity: vec![0.0; num_vars],
-            var_inc: 1.0,
-            var_decay: 0.95, 
-            saved_phases: vec![false; num_vars], 
+            rng_state: 123456789, // Fixed seed for reproducibility
+            num_vars,
         }
     }
 
-    fn var_rescale_activity(&mut self) {
-        for score in &mut self.activity {
-            *score *= 1e-100;
-        }
-        self.var_inc *= 1e-100;
+    /// Simple Xorshift RNG
+    fn next_rand(&mut self) -> usize {
+        let mut x = self.rng_state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.rng_state = x;
+        x as usize
     }
 }
 
-impl BranchingStrategy for VsidsStrategy {
+impl BranchingStrategy for RandomStrategy {
     fn pick_branch(&mut self, solver: &Solver) -> Option<Lit> {
-        let mut best_var = None;
-        let mut max_activity = -1.0;
-
-        for (v, &val) in solver.assignments.iter().enumerate() {
-            if val == VarValue::Unassigned {
-                let score = self.activity[v];
-                if score > max_activity {
-                    max_activity = score;
-                    best_var = Some(v);
-                }
+        // 1. Pick a random starting point
+        let start = self.next_rand() % self.num_vars;
+        
+        // 2. Linear scan from that point to find the first unassigned var.
+        // This ensures we ALWAYS find a variable if one exists.
+        for i in 0..self.num_vars {
+            let idx = (start + i) % self.num_vars;
+            if solver.assignments[idx] == VarValue::Unassigned {
+                // Pick random polarity
+                let is_neg = (self.next_rand() % 2) == 0;
+                return Some(Lit::new(idx, is_neg));
             }
         }
-
-        match best_var {
-            Some(v) => {
-                let saved_is_neg = !self.saved_phases[v]; 
-                Some(Lit::new(v, saved_is_neg)) 
-            }
-            None => None, 
-        }
+        
+        // Only return None if we scanned all variables and found nothing.
+        None
     }
 
-    fn on_conflict(&mut self, involved_vars: &[usize]) {
-        for &v in involved_vars {
-            self.activity[v] += self.var_inc;
-        }
-        self.var_inc *= 1.0 / self.var_decay;
-        if self.var_inc > 1e100 {
-            self.var_rescale_activity();
-        }
+    fn on_conflict(&mut self, _involved_vars: &[usize]) {
+        // Random strategy doesn't learn from conflicts, we need this later for other strats
     }
-    
+
     fn on_assign(&mut self, _var: usize) {}
-
-    fn on_unassign(&mut self, var: usize, old_value: bool) {
-        self.saved_phases[var] = old_value;
-    }
+    fn on_unassign(&mut self, _var: usize, _old_value: bool) {}
 }
 
-// Solver
+// =========================================================================
+// solver
+// =========================================================================
 
-/// Helper Enum to handle the result of clause analysis
-#[derive(Copy, Clone)] 
+#[derive(Copy, Clone)]
 enum Action {
     Conflict(usize),
     Enqueue(Lit, usize),
@@ -141,17 +139,16 @@ enum Action {
 
 pub struct Solver {
     pub clauses: Vec<Clause>,
-    watches: Vec<Vec<usize>>,
+    watches: Vec<Vec<Watcher>>, 
     pub assignments: Vec<VarValue>,
     level: Vec<usize>,
     reason: Vec<Option<usize>>,
     trail: Vec<Lit>,
     trail_lim: Vec<usize>,
     q_head: usize,
-    num_vars: usize,
-
-    // -- Optimization Buffers (Recycled Memory) --
-    prop_buf: Vec<usize>,
+   // num_vars: usize,
+    
+    // Buffers for Zero-Allocation
     analyze_seen: Vec<bool>,
     analyze_toclear: Vec<usize>,
     analyze_clause: Vec<Lit>,
@@ -168,9 +165,8 @@ impl Solver {
             trail: Vec::with_capacity(num_vars),
             trail_lim: Vec::new(),
             q_head: 0,
-            num_vars,
+    //        num_vars,
             
-            prop_buf: Vec::with_capacity(50), 
             analyze_seen: vec![false; num_vars],
             analyze_toclear: Vec::with_capacity(num_vars),
             analyze_clause: Vec::with_capacity(num_vars),
@@ -179,7 +175,6 @@ impl Solver {
 
     pub fn add_clause(&mut self, mut lits: Vec<Lit>) -> bool {
         if lits.is_empty() { return false; }
-        
         lits.sort_by_key(|l| l.to_usize());
         lits.dedup();
 
@@ -188,16 +183,11 @@ impl Solver {
             return self.propagate().is_none(); 
         }
 
-        let clause_idx = self.clauses.len();
-        
-        self.watches[lits[0].not().to_usize()].reserve(4);
-        self.watches[lits[1].not().to_usize()].reserve(4);
-
-        self.watches[lits[0].not().to_usize()].push(clause_idx);
-        self.watches[lits[1].not().to_usize()].push(clause_idx);
+        let clause_idx = self.clauses.len() as u32;
+        self.watches[lits[0].not().to_usize()].push(Watcher { clause_idx, blocker: lits[1] });
+        self.watches[lits[1].not().to_usize()].push(Watcher { clause_idx, blocker: lits[0] });
         
         self.clauses.push(Clause { lits, learned: false });
-
         true
     }
 
@@ -205,7 +195,6 @@ impl Solver {
     fn unchecked_enqueue(&mut self, lit: Lit, reason: Option<usize>) {
         let var = lit.var();
         if self.assignments[var] != VarValue::Unassigned { return; }
-        
         self.assignments[var] = if lit.is_neg() { VarValue::False } else { VarValue::True };
         self.level[var] = self.decision_level();
         self.reason[var] = reason;
@@ -227,7 +216,6 @@ impl Solver {
         }
     }
 
-    /// Optimized Propagate: Zero-Allocation with Action Enum
     fn propagate(&mut self) -> Option<usize> {
         let mut conflict = None;
 
@@ -237,34 +225,46 @@ impl Solver {
 
             let falsified_lit_idx = p.to_usize();
             
-            // Swap buffer to avoid allocation
-            mem::swap(&mut self.watches[falsified_lit_idx], &mut self.prop_buf);
-            self.watches[falsified_lit_idx].clear();
+            // Move the vector out of self to iterate safely
+            let mut watchers = std::mem::take(&mut self.watches[falsified_lit_idx]);
+            
+            let mut i = 0;
+            let mut j = 0; 
 
-            for i in 0..self.prop_buf.len() {
-                let cr_idx = self.prop_buf[i];
+            while i < watchers.len() {
+                let watcher = watchers[i];
+                let cr_idx = watcher.clause_idx as usize;
                 
                 if conflict.is_some() {
-                    self.watches[falsified_lit_idx].push(cr_idx);
-                    continue;
+                    watchers[j] = watchers[i];
+                    j += 1; i += 1; continue;
                 }
 
-                // Use small scope to borrow clauses
+                // Cache friendly
+                if Self::value_lit(&self.assignments, watcher.blocker) == VarValue::True {
+                    watchers[j] = watchers[i]; 
+                    j += 1; i += 1; continue;
+                }
+
+                // Cache Miss: Dereference clause
                 let (action, stop_watching) = {
                     let clause = &mut self.clauses[cr_idx];
                     let false_lit = p.not();
                     
                     if clause.lits[0] == false_lit { clause.lits.swap(0, 1); }
 
-                    let val_0 = Self::value_lit(&self.assignments, clause.lits[0]);
-                    if val_0 == VarValue::True {
+                    if Self::value_lit(&self.assignments, clause.lits[0]) == VarValue::True {
+                        watchers[i].blocker = clause.lits[0]; // Update blocker
                         (None, false) 
                     } else {
                         let mut found_new = false;
                         for k in 2..clause.lits.len() {
                             if Self::value_lit(&self.assignments, clause.lits[k]) != VarValue::False {
                                 clause.lits.swap(1, k);
-                                self.watches[clause.lits[1].not().to_usize()].push(cr_idx);
+                                self.watches[clause.lits[1].not().to_usize()].push(Watcher {
+                                    clause_idx: cr_idx as u32,
+                                    blocker: clause.lits[0] 
+                                });
                                 found_new = true;
                                 break;
                             }
@@ -273,11 +273,9 @@ impl Solver {
                         if found_new {
                             (None, true) 
                         } else {
-                            if val_0 == VarValue::False {
-                                // Conflict: return Action::Conflict (wrapping usize)
+                            if Self::value_lit(&self.assignments, clause.lits[0]) == VarValue::False {
                                 (Some(Action::Conflict(cr_idx)), false) 
                             } else {
-                                // Unit: return Action::Enqueue (wrapping Lit + usize)
                                 (Some(Action::Enqueue(clause.lits[0], cr_idx)), false) 
                             }
                         }
@@ -285,7 +283,8 @@ impl Solver {
                 };
 
                 if !stop_watching {
-                    self.watches[falsified_lit_idx].push(cr_idx);
+                    watchers[j] = watchers[i];
+                    j += 1;
                 }
 
                 if let Some(act) = action {
@@ -294,16 +293,19 @@ impl Solver {
                         Action::Enqueue(lit, reason) => self.unchecked_enqueue(lit, Some(reason)),
                     }
                 }
+                i += 1;
             }
+            
+            watchers.truncate(j);
+            self.watches[falsified_lit_idx] = watchers;
+
+            if let Some(c) = conflict { return Some(c); }
         }
-        
-        conflict
+        None
     }
 
     fn analyze(&mut self, conflict_idx: usize) -> (Vec<Lit>, usize) {
-        for &var in &self.analyze_toclear {
-            self.analyze_seen[var] = false;
-        }
+        for &var in &self.analyze_toclear { self.analyze_seen[var] = false; }
         self.analyze_toclear.clear();
         self.analyze_clause.clear();
 
@@ -323,11 +325,8 @@ impl Solver {
                         self.analyze_seen[var] = true;
                         self.analyze_toclear.push(var);
                         
-                        if self.level[var] == self.decision_level() { 
-                            counter += 1; 
-                        } else { 
-                            self.analyze_clause.push(lit); 
-                        }
+                        if self.level[var] == self.decision_level() { counter += 1; } 
+                        else { self.analyze_clause.push(lit); }
                     }
                 }
             }
@@ -343,9 +342,7 @@ impl Solver {
             if counter == 0 { break; }
         }
 
-        if let Some(lit) = p { 
-            self.analyze_clause.insert(0, lit.not()); 
-        }
+        if let Some(lit) = p { self.analyze_clause.insert(0, lit.not()); }
 
         let backtrack_level = if self.analyze_clause.len() > 1 {
             self.analyze_clause.iter().skip(1).map(|l| self.level[l.var()]).max().unwrap_or(0)
@@ -360,11 +357,12 @@ impl Solver {
             while self.trail.len() > limit {
                 let lit = self.trail.pop().unwrap();
                 let var = lit.var();
-                let old_val_bool = self.assignments[var] == VarValue::True;
+                let old_val = self.assignments[var] == VarValue::True;
                 self.assignments[var] = VarValue::Unassigned;
                 self.reason[var] = None;
                 self.level[var] = 0; 
-                strategy.on_unassign(var, old_val_bool);
+                
+                strategy.on_unassign(var, old_val);
             }
             self.trail_lim.pop();
         }
@@ -379,30 +377,32 @@ impl Solver {
                 let (learned_clause, backtrack_level) = self.analyze(conflict_idx);
                 let involved_vars: Vec<usize> = learned_clause.iter().map(|l| l.var()).collect();
                 strategy.on_conflict(&involved_vars);
-                
+
                 self.backtrack(backtrack_level, strategy);
 
                 if !learned_clause.is_empty() {
-                    let lidx = self.clauses.len();
+                    let lidx = self.clauses.len() as u32;
+                    let c0 = learned_clause[0];
+                    let c1 = if learned_clause.len() > 1 { learned_clause[1] } else { c0 };
                     
                     if learned_clause.len() > 1 {
-                        self.watches[learned_clause[0].not().to_usize()].push(lidx);
-                        self.watches[learned_clause[1].not().to_usize()].push(lidx);
-                    } else if learned_clause.len() == 1 {
-                         self.watches[learned_clause[0].not().to_usize()].push(lidx);
-                         self.watches[learned_clause[0].not().to_usize()].push(lidx); 
+                        self.watches[c0.not().to_usize()].push(Watcher { clause_idx: lidx, blocker: c1 });
+                        self.watches[c1.not().to_usize()].push(Watcher { clause_idx: lidx, blocker: c0 });
+                    } else {
+                         // Unit
+                         self.watches[c0.not().to_usize()].push(Watcher { clause_idx: lidx, blocker: c0 });
+                         self.watches[c0.not().to_usize()].push(Watcher { clause_idx: lidx, blocker: c0 });
                     }
                     
-                    let asserting_lit = learned_clause[0];
                     self.clauses.push(Clause { lits: learned_clause, learned: true });
-                    self.unchecked_enqueue(asserting_lit, Some(lidx));
+                    self.unchecked_enqueue(c0, Some(lidx as usize));
                 }
             } else {
                 match strategy.pick_branch(self) {
-                    Some(next_lit) => {
+                    Some(lit) => {
                         self.trail_lim.push(self.trail.len());
-                        self.unchecked_enqueue(next_lit, None);
-                        strategy.on_assign(next_lit.var());
+                        self.unchecked_enqueue(lit, None);
+                        strategy.on_assign(lit.var());
                     }
                     None => return true, 
                 }
@@ -411,86 +411,28 @@ impl Solver {
     }
 }
 
-// Main & Parsing
+// =========================================================================
+// Helper Functions & Main
+// =========================================================================
 
-fn main() {
-    let args: Vec<String> = env::args().collect();
-    if args.len() < 2 {
-        eprintln!("Usage: {} <path_to_formula>", args[0]);
-        std::process::exit(1);
-    }
-    let path = &args[1];
-
-    println!("Reading formula from: {}", path);
-    let content = match fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("Error reading file: {}", e);
-            std::process::exit(1);
-        }
-    };
-
-    let (clauses, num_vars) = parse_custom_format(&content);
-    println!("Parsed {} variables and {} clauses.", num_vars, clauses.len());
-
-    let mut solver = Solver::new(num_vars);
-    for clause_lits in clauses {
-        solver.add_clause(clause_lits);
-    }
-
-    let mut strategy = VsidsStrategy::new(num_vars);
-    let start_time = std::time::Instant::now();
-    let result = solver.solve(&mut strategy);
-    let duration = start_time.elapsed();
-
-    println!("--------------------------------------------------");
-    if result {
-        println!("Result: SATISFIABLE");
-        println!("Time:   {:.4}s", duration.as_secs_f64());
-        println!("Assignment (positive literals only):");
-        
-        let mut first = true;
-        for (i, val) in solver.assignments.iter().enumerate() {
-            if *val == VarValue::True {
-                if !first { print!(" "); }
-                print!("{}", i + 1);
-                first = false;
-            }
-        }
-        println!();
-    } else {
-        println!("Result: UNSATISFIABLE");
-        println!("Time:   {:.4}s", duration.as_secs_f64());
-    }
-    println!("--------------------------------------------------");
-}
-
-fn parse_custom_format(content: &str) -> (Vec<Vec<Lit>>, usize) {
+pub fn parse_custom_format(content: &str) -> (Vec<Vec<Lit>>, usize) {
     let mut clauses = Vec::new();
     let mut max_var_idx = 0;
-
     for line in content.lines() {
         let line = line.trim();
-        if line.is_empty() || line.starts_with('c') || line.starts_with('#') {
-            continue;
-        }
-
+        if line.is_empty() || line.starts_with('c') || line.starts_with('#') { continue; }
+        // Clean special characters to support both [1, 2] and 1 2 formats
         let cleaned = line.replace('[', " ").replace(']', " ").replace(',', " ");
         let mut current_clause = Vec::new();
-        
         for token in cleaned.split_whitespace() {
             if let Ok(val) = token.parse::<i32>() {
-                if val == 0 { continue; }
+                if val == 0 { continue; } // ignore trailing zeros
                 let (lit, var_idx) = parse_lit(val);
                 current_clause.push(lit);
-                if var_idx > max_var_idx {
-                    max_var_idx = var_idx;
-                }
+                if var_idx > max_var_idx { max_var_idx = var_idx; }
             }
         }
-        if !current_clause.is_empty() {
-            clauses.push(current_clause);
-        }
+        if !current_clause.is_empty() { clauses.push(current_clause); }
     }
     (clauses, max_var_idx + 1)
 }
@@ -499,4 +441,95 @@ fn parse_lit(val: i32) -> (Lit, usize) {
     let var_idx = (val.abs() as usize) - 1; 
     let is_neg = val < 0;
     (Lit::new(var_idx, is_neg), var_idx)
+}
+
+pub fn run_solver_on_content(content: &str) -> bool {
+    let (clauses, num_vars) = parse_custom_format(content);
+    let mut solver = Solver::new(num_vars);
+    for clause_lits in clauses {
+        solver.add_clause(clause_lits);
+    }
+    let mut strategy = RandomStrategy::new(num_vars);
+    solver.solve(&mut strategy)
+}
+
+fn main() {
+    let args: Vec<String> = env::args().collect();
+    // Default to the first argument that isn't a flag
+    let path = args.iter().skip(1).find(|&a| !a.starts_with("--"));
+
+    if path.is_none() {
+        eprintln!("Usage: {} <path_to_formula>", args[0]);
+        std::process::exit(1);
+    }
+    let path = path.unwrap();
+
+    let content = match fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) => { eprintln!("{}", e); std::process::exit(1); }
+    };
+
+    let start = std::time::Instant::now();
+    let result = run_solver_on_content(&content);
+    let duration = start.elapsed();
+
+    println!("--------------------------------------------------");
+    if result {
+        println!("Result: SATISFIABLE");
+    } else {
+        println!("Result: UNSATISFIABLE");
+    }
+    println!("Time:   {:.4}s", duration.as_secs_f64());
+    println!("--------------------------------------------------");
+}
+
+// =========================================================================
+// Tests
+// =========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+
+    #[test]
+    fn test_satisfiable_instances() {
+        let sat_dir = PathBuf::from("CNF/SAT");
+        if !sat_dir.exists() {
+            eprintln!("Warning: CNF/SAT directory not found, skipping.");
+            return;
+        }
+
+        for entry in fs::read_dir(sat_dir).expect("Failed to read CNF/SAT") {
+            let entry = entry.expect("Error reading entry");
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) == Some("cnf") {
+                println!("Testing SAT: {:?}", path);
+                let content = fs::read_to_string(&path).expect("Failed to read");
+                let result = run_solver_on_content(&content);
+                assert!(result, "Failed: {:?} should be SAT", path);
+            }
+        }
+    }
+
+    #[test]
+    fn test_unsatisfiable_instances() {
+        let unsat_dir = PathBuf::from("CNF/UNSAT");
+        if !unsat_dir.exists() {
+            eprintln!("Warning: CNF/UNSAT directory not found, skipping.");
+            return;
+        }
+
+        for entry in fs::read_dir(unsat_dir).expect("Failed to read CNF/UNSAT") {
+            let entry = entry.expect("Error reading entry");
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) == Some("cnf") {
+                println!("Testing UNSAT: {:?}", path);
+                let content = fs::read_to_string(&path).expect("Failed to read");
+                let result = run_solver_on_content(&content);
+                assert!(!result, "Failed: {:?} should be UNSAT", path);
+            }
+        }
+    }
 }
