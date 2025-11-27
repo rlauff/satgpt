@@ -7,3 +7,10 @@ edition = "2024"
 
 [profile.release]
 debug = true
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "solver_benchmark"
+harness = false

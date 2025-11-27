@@ -1,3 +1,4 @@
 perf*
 flamegraph*
-cnf
+target/
+Cargo.lock
