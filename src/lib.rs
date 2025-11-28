@@ -1,5 +1,8 @@
 use std::fmt;
 
+// Import the new module
+pub mod preprocessing;
+
 // =========================================================================
 // Core Types (Must be pub for benchmarking)
 // =========================================================================
@@ -53,9 +56,9 @@ pub enum VarValue {
 
 #[derive(Debug, Clone)]
 pub struct Clause {
-    lits: Vec<Lit>,
+    pub lits: Vec<Lit>,
     #[allow(dead_code)]
-    learned: bool, // Distinguish between original problem clauses and learned conflicts
+    pub learned: bool,
 }
 
 /// A "Watcher" is a reference to a clause that is watching a specific literal.
@@ -150,7 +153,7 @@ pub struct Solver {
     trail: Vec<Lit>,       // Chronological stack of assignments
     trail_lim: Vec<usize>, // Indices in trail separating decision levels
     q_head: usize,         // Queue pointer for propagation
-    // num_vars: usize,
+    num_vars: usize,       // Added num_vars to struct for easy access
     
     // We reuse these vectors during conflict analysis to avoid heap allocation overhead.
     analyze_seen: Vec<bool>,
@@ -169,7 +172,7 @@ impl Solver {
             trail: Vec::with_capacity(num_vars),
             trail_lim: Vec::new(),
             q_head: 0,
- //           num_vars,
+            num_vars,
             
             // Pre-allocate buffers
             analyze_seen: vec![false; num_vars],
@@ -200,6 +203,24 @@ impl Solver {
         
         self.clauses.push(Clause { lits, learned: false });
         true
+    }
+
+    /// Helper to clear and rebuild watches.
+    /// This is needed after preprocessing modifies the clause database.
+    fn rebuild_watches(&mut self) {
+        // Clear all watch lists
+        for w in &mut self.watches {
+            w.clear();
+        }
+
+        // Re-add watchers for all clauses
+        for (i, clause) in self.clauses.iter().enumerate() {
+            if clause.lits.len() > 1 {
+                let c_idx = i as u32;
+                self.watches[clause.lits[0].not().to_usize()].push(Watcher { clause_idx: c_idx, blocker: clause.lits[1] });
+                self.watches[clause.lits[1].not().to_usize()].push(Watcher { clause_idx: c_idx, blocker: clause.lits[0] });
+            }
+        }
     }
 
     /// Assigns a value to a literal and adds it to the propagation trail.
@@ -409,7 +430,31 @@ impl Solver {
     }
 
     /// Main CDCL Loop
-    pub fn solve(&mut self, strategy: &mut dyn BranchingStrategy) -> bool {
+    pub fn solve(&mut self, strategy: &mut dyn BranchingStrategy, verbose: bool) -> bool {
+        // == PREPROCESSING STEP ==
+        if verbose { println!("Running Preprocessing: Gaussian Elimination + Substitution..."); }
+        
+        // Pass reference. Only replace if result is Some(...) indicating actual simplification.
+        if let Some(result) = preprocessing::preprocess(&self.clauses, self.num_vars) {
+            if verbose {
+                println!("Preprocessing successful.");
+                println!("  - Original clauses: {}", self.clauses.len());
+                println!("  - New clauses: {}", result.clauses.len());
+                println!("  - Found Units: {}", result.units.len());
+            }
+
+            self.clauses = result.clauses;
+            self.rebuild_watches(); // Rebuild watches for the new clause set
+            
+            // Apply found unit literals
+            for lit in result.units {
+                self.unchecked_enqueue(lit, None);
+            }
+        } else {
+            if verbose { println!("Preprocessing found no simplifications. Keeping original clauses."); }
+            // Do NOT rebuild watches, do NOT touch self.clauses. Fast path.
+        }
+
         loop {
             // 1. Propagate assignments
             if let Some(conflict_idx) = self.propagate() {
@@ -465,10 +510,20 @@ impl Solver {
 pub fn parse_custom_format(content: &str) -> (Vec<Vec<Lit>>, usize) {
     let mut clauses = Vec::new();
     let mut max_var_idx = 0;
-    for line in content.lines() {
+    
+    // Check if "p cnf" exists. If so, we should skip everything before it.
+    let start_parsing = content.lines().position(|l| l.starts_with("p cnf"));
+    
+    // Create an iterator that either starts from "p cnf" + 1 or from the beginning
+    let lines_iter = match start_parsing {
+        Some(idx) => content.lines().skip(idx + 1),
+        None => content.lines().skip(0),
+    };
+
+    for line in lines_iter {
         let line = line.trim();
-        // Skip comments
-        if line.is_empty() || line.starts_with('c') || line.starts_with('#') || line.starts_with('%') { continue; }
+        // Skip comments and empty lines
+        if line.is_empty() || line.starts_with('c') || line.starts_with('%') || line.starts_with('0') { continue; }
         
         // Sanitize input
         let cleaned = line.replace('[', " ").replace(']', " ").replace(',', " ");
@@ -494,12 +549,12 @@ pub fn parse_lit(val: i32) -> (Lit, usize) {
 }
 
 /// Convenience function to parse and solve a string content
-pub fn run_solver_on_content(content: &str) -> bool {
+pub fn run_solver_on_content(content: &str, verbose: bool) -> bool {
     let (clauses, num_vars) = parse_custom_format(content);
     let mut solver = Solver::new(num_vars);
     for clause_lits in clauses {
         solver.add_clause(clause_lits);
     }
     let mut strategy = RandomStrategy::new(num_vars);
-    solver.solve(&mut strategy)
+    solver.solve(&mut strategy, verbose)
 }

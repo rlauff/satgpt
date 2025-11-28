@@ -1,6 +1,6 @@
 use std::env;
 use std::fs;
-use satgpt::*; // Import from the library
+use satgpt::*;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -23,7 +23,7 @@ fn main() {
     let start = std::time::Instant::now();
     
     // Call the library function
-    let result = run_solver_on_content(&content);
+    let result = run_solver_on_content(&content, true);
     
     let duration = start.elapsed();
 
@@ -54,7 +54,7 @@ mod tests {
             if path.extension().and_then(|s| s.to_str()) == Some("cnf") {
                 println!("Testing SAT: {:?}", path);
                 let content = fs::read_to_string(&path).unwrap();
-                let result = run_solver_on_content(&content);
+                let result = run_solver_on_content(&content, true);
                 assert!(result, "Failed: {:?} should be SAT", path);
             }
         }
@@ -70,7 +70,7 @@ mod tests {
             if path.extension().and_then(|s| s.to_str()) == Some("cnf") {
                 println!("Testing UNSAT: {:?}", path);
                 let content = fs::read_to_string(&path).unwrap();
-                let result = run_solver_on_content(&content);
+                let result = run_solver_on_content(&content, true);
                 assert!(!result, "Failed: {:?} should be UNSAT", path);
             }
         }

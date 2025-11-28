@@ -44,7 +44,7 @@ fn bench_cnf_folder(c: &mut Criterion) {
             group.bench_function(file_name, |b| {
                 b.iter(|| {
                     // running benchmark
-                    run_solver_on_content(&content)
+                    run_solver_on_content(&content,false)
                 })
             });
             count += 1;
