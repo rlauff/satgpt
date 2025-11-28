@@ -435,21 +435,22 @@ impl Solver {
         if verbose { println!("Running Preprocessing: Gaussian Elimination + Substitution..."); }
         
         // Pass reference. Only replace if result is Some(...) indicating actual simplification.
-        if let Some(result) = preprocessing::preprocess(&self.clauses, self.num_vars) {
-            if verbose {
-                println!("Preprocessing successful.");
-                println!("  - Original clauses: {}", self.clauses.len());
-                println!("  - New clauses: {}", result.clauses.len());
-                println!("  - Found Units: {}", result.units.len());
-            }
+        //if let Some(result) = preprocessing::preprocess(&self.clauses, self.num_vars) {
+        if false { // Disable preprocessing for now
+            // if verbose {
+            //     println!("Preprocessing successful.");
+            //     println!("  - Original clauses: {}", self.clauses.len());
+            //     println!("  - New clauses: {}", result.clauses.len());
+            //     println!("  - Found Units: {}", result.units.len());
+            // }
 
-            self.clauses = result.clauses;
-            self.rebuild_watches(); // Rebuild watches for the new clause set
+            // self.clauses = result.clauses;
+            // self.rebuild_watches(); // Rebuild watches for the new clause set
             
-            // Apply found unit literals
-            for lit in result.units {
-                self.unchecked_enqueue(lit, None);
-            }
+            // // Apply found unit literals
+            // for lit in result.units {
+            //     self.unchecked_enqueue(lit, None);
+            // }
         } else {
             if verbose { println!("Preprocessing found no simplifications. Keeping original clauses."); }
             // Do NOT rebuild watches, do NOT touch self.clauses. Fast path.
